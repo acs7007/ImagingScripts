@@ -1,0 +1,270 @@
+%Matlab function to perform statistical analysis on processed data
+%Determines which cells are "significant responders"
+
+function [mouse] = individual_analysis_mad_smoothed_martin_liz(mouse_info)
+%individual_analysis Summary of this function goes here
+%   mouse_info: output of dir()
+
+
+%% load data
+cohort_path = mouse_info.folder;
+mouse_path = [mouse_info.folder, '/', mouse_info.name];
+load([cohort_path, '/cohort.mat'])
+load([mouse_path, '/mouse.mat'])
+
+
+%% organize variables
+% From mouse metadata
+data = mouse.data;
+frames = mouse.frames; %total number of frames recorded for all analyzed trials
+trial_frames = mouse.frames/mouse.num_trials; 
+num_trials = mouse.num_trials; %temporary to try and combine animals with different numbers of trials
+cells = mouse.cells;
+trialorder = mouse.trialorder;
+
+
+% From cohort metadata
+stimuli = cohort.stimuli;
+num_stimuli = cohort.num_stimuli;
+stimON = cohort.stimON;
+stimOFF = cohort.stimOFF;
+washOFF = cohort.washOFF;
+baselineBounds = cohort.baselinebounds;
+trialBounds = cohort.trialBounds;
+framerate = cohort.framerate;
+stim_off_time = stimOFF./framerate; %stim_off in seconds
+stimulus_window = 60 + stim_off_time; %how many seconds after stim_off to look_for responders
+response_window = 60 + stim_off_time; %How long in seconds to look at responses (e.g. calculating AUC or searching for max);
+integration_window = 120+stim_off_time;
+baseline_data = [];
+baseline_data_pages = [];
+threshold = 1.6;
+trials_per_stim = num_trials/num_stimuli;
+trial_threshold = floor(trials_per_stim./2)+1; %has to respond in more than half of trials;
+trial_responders = nan(cells,num_trials); %binary matrix of response for a trial
+responders = nan(cells,length(stimuli));
+
+
+responses = reshape(data,cells,trialBounds(1,2),num_trials); %separate trials into separate trials before smoothing
+responses_smoothed = smoothdata(responses,2,'movmean',50);%smooth trials
+data_smoothed = reshape(responses_smoothed,cells,frames); %put all data back together again
+
+
+
+
+
+
+%% concatenate all baseline data for a single cell across experiment
+for i = 1:num_trials
+    %get baseline frames using 10 frames after start of trial to 5frames befor start of stim 
+    %and 30 seconds before end of trial
+    pre_stim_start =  trial_frames*(i-1)+10;
+    pre_stim_stop = trial_frames*(i-1)+195; 
+    post_stim = trial_frames*i-200; %60 seconds before end
+    trial_end = trial_frames*i;
+    if i == 1
+        baseline_data = [data_smoothed(:,post_stim:trial_end)];
+    else
+        baseline_data = [baseline_data data_smoothed(:,pre_stim_start:pre_stim_stop) data_smoothed(:,post_stim:trial_end)];
+    end
+    
+    baseline_data_pages(:,:,i) = [data_smoothed(:,post_stim:trial_end) data_smoothed(:,pre_stim_start:pre_stim_stop)];
+end
+
+
+%%Calculate mad for baseline and modified z-scores of data
+mad_DFF = mad(baseline_data,[],2);
+median_DFF = median(baseline_data,2);
+popstd = 1.4826*median_DFF;
+mzscore_matrix =(0.6745*(data-repmat(median_DFF,1,frames)))./repmat(mad_DFF,1,frames);
+
+
+%%Check for mean modified z-score greater than threshold in 90 seconds
+%%following stimulus stop
+for i = 1:num_trials
+    responder_window_start = round(trial_frames*(i-1)+cohort.stimOFF); %end of stimulus
+    responder_window_end = round(1000*(i-1)+cohort.stimOFF+90*framerate); %can alternatively set in cohort to not be hard coded
+    trial_responders(1:cells,i) = mean(mzscore_matrix(:,responder_window_start:responder_window_end),2) > threshold;
+    
+    %take 10 second moving average and find first point (10 second window)
+    %where average is greater than threshold (for later sorting)
+    binned_mzscore =  smoothdata(mzscore_matrix(:,responder_window_start:responder_window_end),2,'movmean',round(10*framerate));
+%     binned_mzscore =  smoothdata(mzscore_matrix(:,responder_window_start:responder_window_end),2,'movmean',round(10*framerate));
+%     
+    for j = 1:cells
+        first_bin = find(binned_mzscore(j,:) > threshold, 1, 'first')+responder_window_start;
+        if ~isempty(first_bin) 
+            first_responding_bin(j,i) = first_bin; %find first responding bin for each cell, add to responder_window_start to get trial time of response start
+            
+        else
+            first_responding_bin(j,i) = nan;
+            
+        end
+  
+    end
+end
+disp('trial_responders calculated');
+mouse.baseline_data = baseline_data;
+mouse.baseline_data_pages = baseline_data_pages;
+%% determine responders as those who respond on >= half+1 of trials  
+filter = false(cells,1);
+ for stim = 1:num_stimuli
+    sum_responding_trials(:,stim) = sum(trial_responders(:,trialorder(stim,:)),2);
+    
+    %greater than or equal to 1 more than half of trials
+    responders(:,stim) = sum_responding_trials(:,stim) >= trial_threshold; 
+    filter_stim = neuropil_filter(mouse_path, cells, 'max', 10, trialorder(stim,:));
+    filter = or(filter, filter_stim);
+ end
+ 
+ mouse.pre_fil_responders = responders;
+ 
+ %% neuropil filtration of responding cells
+ if num_stimuli > 1
+    for stim = 1:num_stimuli
+        responders(:,stim) = and(responders(:,stim), filter);
+    end
+ else
+     responders = and(responders, filter);
+ end
+ 
+%% Some data to keep in mouse file
+mouse.MZscore = mzscore_matrix;
+mouse.first_responding_bin = first_responding_bin;
+mouse.threshold = threshold;
+mouse.trial_threshold = trial_threshold;
+mouse.resp_trials = trial_responders;
+mouse.responders = responders;
+mouse.filter = filter;
+mouse.mad_DFF = mad_DFF;
+mouse.median_DFF = median_DFF;
+
+
+%% Calculate average trial curve (with error)
+averageResponse = NaN(cells,trialBounds(1,2),num_stimuli);
+averageResponseSmooth = NaN(cells,trialBounds(1,2),num_stimuli);
+averageError = NaN(cells,frames/num_trials,num_stimuli);
+meanAUC = NaN(cells,num_stimuli);
+maxAUC = NaN(cells,num_stimuli);
+maxDFF = NaN(cells, 1, num_trials);%of average
+avg_AUC_smooth =  NaN(cells,num_stimuli);
+avg_max_smooth =  NaN(cells,num_stimuli); %avg_... of max calculated from single smoothed trials not calculated from smoothed average
+
+
+%%Calculate single trial AUC or max for blocker analysis
+AUC_smooth = NaN(cells, 1, num_trials);
+maxDFF_smooth = NaN(cells, 1, num_trials);
+maxDFF_rescaled= NaN(cells, 1, num_trials);
+
+
+tic
+post_smooth_full = data_smoothed;
+%transpose and scale to min/max of each column
+
+
+amin = min(post_smooth_full');
+amax = max(post_smooth_full');
+bmin = min(post_smooth_full,[],2);
+bmax = max(post_smooth_full,[],2);
+max_smooth = max(post_smooth_full');
+min_smooth = min(post_smooth_full');
+rescaled_smooth = (post_smooth_full'- min_smooth) ./ (max_smooth-min_smooth);
+% rescaled_smooth = rescale(post_smooth_full','InputMin',min(post_smooth_full'),'InputMax',max(post_smooth_full'));
+%put back into single trial dimensions
+rescaled_smooth = reshape(rescaled_smooth',cells,trialBounds(1,2),num_trials);
+
+
+
+
+AUC_smooth = trapz(rescaled_smooth(:,stimON:round(integration_window*framerate),:),2); %integral of rescaled [0 1] smoothed traces
+maxDFF_smooth_rescaled = squeeze(max(rescaled_smooth(:,stimON:round(response_window*framerate),:),[],2));%max of rescaled [0 1] smoothed traces looking in integration window(differ from response window how?)
+maxDFF_smooth = squeeze(max(responses_smoothed(:,stimON:round(response_window*framerate),:),[],2));%max of smoothed dff
+maxDFF = squeeze(max(responses(:,stimON:round(response_window*framerate),:),[],2)); %get the max value during response for each stimulus
+ 
+for s = 1:num_stimuli
+    
+    averageResponse(:,:,s) = mean(responses(:,:,trialorder(s,:)),3);
+    averageResponseSmooth(:,:,s) = mean(responses_smoothed(:,:,trialorder(s,:)),3); %average of smoothed single trials
+    z_scored_average_smooth (:,:,s) = zscore(averageResponseSmooth(:,:,s)); %z-score of average trace, for use in heatmap 4/7  
+    disp('average of smooth z-scored');
+    
+    
+    for cellnow = 1:cells
+        for t = 1:num_trials
+            temp_smooth_data = smoothdata(mouse.data_pages(cellnow,round(cohort.stimON):round(cohort.stimON+90*framerate),t), 'movmean', 10);
+            temp_data = smoothdata(mouse.data_pages(cellnow,round(cohort.stimOFF):round(cohort.stimON+90*framerate),t), 'movmean', 10);
+            max_temp = max(temp_smooth_data);
+            max_raw = max(temp_data);
+            zbin_max_loc_trial = find(temp_smooth_data >= 0.5*(0.5*max_temp+0.05*max_temp), 1, 'first');
+            z_raw = find(temp_data >= 0.5*(0.5*max_raw+0.05*max_raw), 1, 'first');
+            
+            if ~isempty(zbin_max_loc_trial)
+                if zbin_max_loc_trial <= 2
+                    latencies(cellnow,t) = z_raw+round(cohort.stimOFF);
+                else
+                    latencies(cellnow,t) = zbin_max_loc_trial+round(cohort.stimON);
+                end
+                
+                latencies2(cellnow,t) = z_raw;
+            else
+                latencies(cellnow,t) = round(cohort.stimON+90*framerate);
+                latencies2(cellnow,t) = round(cohort.stimON+90*framerate);
+            end
+        end
+        responder_window_start = round(cohort.stimOFF); %end of stimulus
+        responder_window_end = round(cohort.stimOFF+90*framerate); %can alternatively set in cohort to not be hard coded
+        %find the first point on average of smooths where z is rising and 
+%         z_bin_now = find((z_scored_average_smooth(cellnow,responder_window_start:responder_window_end,s) > 1 & [diff(z_scored_average_smooth(cellnow,responder_window_start:responder_window_end,s))>0 0]), 1, 'first');
+        [zbin_max zbin_max_loc] = max(smoothdata(z_scored_average_smooth(cellnow,responder_window_start:responder_window_end,s),2,'movmean',10),[],2);
+        if ~isempty(zbin_max_loc)
+        first_smooth_zbin(cellnow,s) = zbin_max_loc+ responder_window_start;
+        else
+            first_smooth_zbin(cellnow,s) = responder_window_end;
+        end
+    end
+    
+    
+    
+    %calculate average stimulus error
+    averageError(:,:,s) = std(responses(:,:,trialorder(s,:)),0,3);%get error across trials
+    
+     %for each average stimulus trial calculate the mean stim-related AUC
+    meanAUC(:,s) = trapz(averageResponse(:,stimON:round(response_window*framerate),s),2);
+    %also find maxFluorescence in avg stimulus
+    maxAUC(:,s) = squeeze(max(averageResponse(:,stimON:round(response_window*framerate),s),[],2));
+    
+    avg_AUC_smooth (:,s) = mean(AUC_smooth(:,:,trialorder(s,1:2)),3); %Just taking AUC of first two trials of a stim
+    avg_maxDFF_smooth (:,s) = mean(maxDFF_smooth(:,trialorder(s,:)),2);
+    first_two_difference (:,s) = (diff(maxDFF_smooth(:,trialorder(s,1:2)),1,2).*-1); %take the difference of the first two trials(s,1:2) using diff (2)-(1) and multiply by  -1 to get decreas
+    firt_two_difference_AUC(:,s) = diff(AUC_smooth(:,trialorder(s,1:2)),1,2).*-1; 
+    first_two_decrease(:,s) = first_two_difference(:,s)./squeeze(maxDFF_smooth(:,trialorder(s,1))); %get the percent decrease
+    first_two_decrease_AUC(:,s) = first_two_difference(:,s)./squeeze(AUC_smooth(:,trialorder(s,1)));
+    first_two_max_average (:,s) = mean(maxDFF_smooth(:,trialorder(s,1:2)),2);
+
+
+end
+
+
+mouse.latencies = latencies;
+mouse.latencies2 = latencies2;
+mouse.averageResponse = averageResponse;
+mouse.averageResponseSmooth = averageResponseSmooth;
+mouse.averageError = averageError;
+mouse.meanAUC = meanAUC;
+mouse.maxAUC = maxAUC;
+mouse.maxDFF = maxDFF; %max for single trials
+mouse.maxDFF_smooth = maxDFF_smooth; %max for smoothed single trials from stim_on:response_window (set in make_cohort)
+% mouse.maxDFF_smooth_loc = maxDFF_smooth_loc;
+mouse.AUC_smooth = AUC_smooth; %AUC for smoothed single trials from stim_on:response_window (set in make_cohort)
+mouse.avg_AUC_smooth =  avg_AUC_smooth;
+mouse.avg_maxDFF_smooth = avg_maxDFF_smooth; %This is the averaged across trials version
+mouse.first_two_difference = first_two_difference;
+mouse.first_two_decrease = first_two_decrease;
+mouse.first_two_max_average = first_two_max_average; %gets the average of first two trials of a smoothed stim;
+mouse.first_two_decrease_AUC = first_two_decrease_AUC;
+mouse.z_scored_average_smooth = z_scored_average_smooth;
+mouse.first_smooth_zbin = first_smooth_zbin;
+save([mouse_path, '/mouse.mat'], 'mouse')
+
+
+end

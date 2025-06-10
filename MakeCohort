@@ -1,0 +1,57 @@
+%MatLab function to create a cohort of mice
+%All mice in a cohort were run under similar experimental conditions: length of trial, number of stimuli, etc
+
+    function make_cohort(cohort_info, stimuli, num_trials, stim_constraints, framerate, trialseconds, baselinebounds, trial_details)
+    % stimuli:           array of strings of stimuli names e.g. ["Glucose","AceK", "MDG"]
+    % num_trials:        int, total number of trials in experiment
+    % cohort_info:       struct of directory info for a cohort - output of dir()
+    % stim_constraints:  3x2 int array where
+    %                       rows = stimulus, wash, max
+    %                       columns = ON, OFF 
+    % framerate:         how many frames collected per second
+    % trialseconds:      number of seconds per trial 
+    % baselinebounds:    1x2 int array (beginning and ending frames of baseline)
+    ﻿
+    %%
+    % stimIN = 50 seconds
+    % stimOUT = 180 seconds
+    cohort = struct;
+    cohort.name = cohort_info.name;
+    cohort.stimuli = stimuli;
+    cohort.num_stimuli = length(stimuli);
+    cohort.num_trials = num_trials;
+    ﻿
+    cohort.stimON = stim_constraints(1,1);
+    cohort.stimOFF = stim_constraints(1,2);
+    cohort.washON = stim_constraints(2,1);
+    cohort.washOFF = stim_constraints(2,2);
+    cohort.maxON = stim_constraints(3,1);
+    cohort.maxOFF = stim_constraints(3,2);
+    ﻿
+    cohort.trial_details = trial_details;
+    ﻿
+    cohort.framerate = framerate;
+    cohort.trialseconds = trialseconds;
+    cohort.frames = framerate*trialseconds*num_trials;
+    cohort.baselinebounds = baselinebounds;
+    cohort.total_cells = 0;
+    ﻿
+    %% establish trial bounds
+    % array to store trial bounds (#trials rows * column1=start, column2=end)
+    trialBounds = NaN(num_trials,2);
+    ﻿
+    % make start of first trial = 1, stop of last trial = last frame
+    trialBounds(1,1)=1; 
+    trialBounds(num_trials,2) = cohort.frames;  
+    ﻿
+    % assign the rest of the boundaries 
+    for t = 1:num_trials
+        trialBounds(t,2) = (cohort.frames/num_trials)*t;
+        trialBounds(t,1) = trialBounds(t,2) - (cohort.frames/num_trials) +1;
+    end
+    ﻿
+    cohort.trialBounds = trialBounds;
+    save([cohort_info.folder, '/', cohort_info.name, '/cohort.mat'], 'cohort');
+    end
+    ﻿
+    ﻿
